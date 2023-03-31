@@ -111,7 +111,7 @@ def main():
             t, _ = schedule_sampler.sample(batch.shape[0], dist_util.dev())
             batch = diffusion.q_sample(batch, t)
         else:
-            t = th.zeros(batch.shape[0], dtype=th.long, device=dist_util.dev())
+            t = th.zeros(batch.shape[0], dtype=th.long, device=dist_util.dev()) 
 
         for i, (sub_batch, sub_labels, sub_t) in enumerate(
             split_microbatches(args.microbatch, batch, labels, t)

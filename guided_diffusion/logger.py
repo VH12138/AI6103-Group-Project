@@ -445,11 +445,18 @@ def configure(dir=None, format_strs=None, comm=None, log_suffix=""):
     """
     if dir is None:
         dir = os.getenv("OPENAI_LOGDIR")
+    # if dir is None:
+    #     dir = osp.join(
+    #         tempfile.gettempdir(),
+    #         datetime.datetime.now().strftime("%Y-%m-%d-%H-%M"),
+    #     )
+
     if dir is None:
         dir = osp.join(
-            tempfile.gettempdir(),
-            datetime.datetime.now().strftime("openai-%Y-%m-%d-%H-%M-%S-%f"),
+            '/home/jhan/6103/AI6103-Group-Project/output',
+            datetime.datetime.now().strftime("%Y-%m-%d-%H-%M"),
         )
+
     assert isinstance(dir, str)
     dir = os.path.expanduser(dir)
     os.makedirs(os.path.expanduser(dir), exist_ok=True)

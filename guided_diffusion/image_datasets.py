@@ -1,12 +1,35 @@
 import math
 import random
+import os 
+import pickle 
 
+import torch 
+import torch.distributed as dist 
+from torch.utils.data import DataLoader, Dataset
+import torchvision.transforms as transforms
+
+import clip 
 from PIL import Image
 import blobfile as bf
 from mpi4py import MPI
 import numpy as np
-from torch.utils.data import DataLoader, Dataset
+import json 
+import io
 
+def load_ref_data(args, ref_img_path=None):
+    if ref_img_path is None:
+        ref_img_path = args.ref_img_path
+    with bf.BlobFile(ref_img_path, "rb") as f:
+        pil_image = Image.open(f)
+        pil_image.load()
+
+    pil_image = pil_image.convert("RGB")
+    arr = center_crop_arr(pil_image, args.image_size)
+    arr = arr.astype(np.float32) / 127.5 - 1
+    arr = np.repeat(np.expand_dims(np.transpose(arr, [2, 0, 1]), axis=0), args.batch_size, axis=0)
+    kwargs = {}
+    kwargs["ref_img"] = torch.tensor(arr)
+    return kwargs
 
 def load_data(
     *,

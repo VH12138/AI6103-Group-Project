@@ -2,24 +2,22 @@ import gc
 import io
 import math
 import sys
+import os
 
-from PIL import Image
+import time
+import datetime
+
+import lpips
 import requests
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torchvision import transforms
 from torchvision.transforms import functional as TF
-from tqdm.notebook import tqdm
+import numpy as np
 
 import clip
 from guided_diffusion.script_util import create_model_and_diffusion, model_and_diffusion_defaults
-
-
-def parse_prompt(prompt):
-    vals = prompt.rsplit(':', 1)
-    vals = vals + ['', '1'][len(vals):]
-    return vals[0], float(vals[1])
 
 
 class MakeCutouts(nn.Module):
@@ -43,6 +41,12 @@ class MakeCutouts(nn.Module):
         return torch.cat(cutouts)
 
 
+def parse_prompt(prompt):
+    vals = prompt.rsplit(':', 1)
+    vals = vals + ['', '1'][len(vals):]
+    return vals[0], float(vals[1])
+
+
 def spherical_dist_loss(x, y):
     x = F.normalize(x, dim=-1)
     y = F.normalize(y, dim=-1)
@@ -62,14 +66,14 @@ def range_loss(input):
 
 
 def main():
+# ====================================================== config setting =================================================== #
     model_config = model_and_diffusion_defaults()
     model_config.update({
         'attention_resolutions': '32, 16, 8',
         'class_cond': False,
         'diffusion_steps': 1000,
         'rescale_timesteps': True,
-        'timestep_respacing': '1000',  # Modify this value to decrease the number of
-                                    # timesteps.
+        'timestep_respacing': '1000',  # Modify this value to decrease the number of timesteps.
         'image_size': 256,
         'learn_sigma': True,
         'noise_schedule': 'linear',
@@ -82,8 +86,20 @@ def main():
         'use_scale_shift_norm': True,
     })
 
+    prompts = ['A photo of a bedroom.']
+    image_prompts = []
+    batch_size = 1
+    clip_guidance_scale = 1000  # Controls how much the image should look like the prompt.
+    tv_scale = 150              # Controls the smoothness of the final output.
+    range_scale = 50            # Controls how far out of range RGB values are allowed to be.
+    cutn = 16
+    n_batches = 1
+    init_image = None   # This can be an URL or Colab local path and must be in quotes.
+    skip_timesteps = 0  # This needs to be between approx. 200 and 500 when using an init image.
+    init_scale = 0      # This enhances the effect of the init image, a good value is 1000.
+    seed = 0
 
-    # Load models
+# ======================================================= Load models ============================================================ #
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
 
@@ -97,23 +113,7 @@ def main():
     clip_size = clip_model.visual.input_resolution
     normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                     std=[0.26862954, 0.26130258, 0.27577711])
-    # lpips_model = lpips.LPIPS(net='vgg').to(device)
-
-    prompts = ['A photo of a bedroom with a painting on the wall.']
-    image_prompts = []
-    batch_size = 16
-    clip_guidance_scale = 1000  # Controls how much the image should look like the prompt.
-    tv_scale = 150              # Controls the smoothness of the final output.
-    range_scale = 50            # Controls how far out of range RGB values are allowed to be.
-    cutn = 16
-    n_batches = 1
-    init_image = None   # This can be an URL or Colab local path and must be in quotes.
-    skip_timesteps = 0  # This needs to be between approx. 200 and 500 when using an init image.
-                        # Higher values make the output look more like the init.
-    init_scale = 0      # This enhances the effect of the init image, a good value is 1000.
-    seed = 0
-
-
+    lpips_model = lpips.LPIPS(net='vgg').to(device)
     if seed is not None:
         torch.manual_seed(seed)
 
@@ -162,20 +162,21 @@ def main():
         tv_losses = tv_loss(x_in)
         range_losses = range_loss(out['pred_xstart'])
         loss = losses.sum() * clip_guidance_scale + tv_losses.sum() * tv_scale + range_losses.sum() * range_scale
-        # if init is not None and init_scale:
-        #     init_losses = lpips_model(x_in, init)
-        #     loss = loss + init_losses.sum() * init_scale
+        if init is not None and init_scale:
+            init_losses = lpips_model(x_in, init)
+            loss = loss + init_losses.sum() * init_scale
         return -torch.autograd.grad(loss, x)[0]
 
     if model_config['timestep_respacing'].startswith('ddim'):
-        sample_fn = diffusion.ddim_sample_loop_progressive
+        sample_fn = diffusion.ddim_sample_loop
     else:
-        sample_fn = diffusion.p_sample_loop_progressive
+        sample_fn = diffusion.p_sample_loop
 
+    all_images = []
     for i in range(n_batches):
         cur_t = diffusion.num_timesteps - skip_timesteps - 1
 
-        samples = sample_fn(
+        sample = sample_fn(
             model,
             (batch_size, 3, side_y, side_x),
             clip_denoised=False,
@@ -188,15 +189,27 @@ def main():
             cond_fn_with_grad=True,
         )
 
-        for j, sample in enumerate(samples):
-            cur_t -= 1
-            if j % 100 == 0 or cur_t == -1:
-                print()
-                for k, image in enumerate(sample['pred_xstart']):
-                    filename = f'progress_{i * batch_size + k:05}.png'
-                    TF.to_pil_image(image.add(1).div(2).clamp(0, 1)).save(filename)
-                    tqdm.write(f'Batch {i}, step {j}, output {k}:')
-                    display.display(display.Image(filename))
+        sample = ((sample + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+        sample = sample.permute(0, 2, 3, 1)
+        sample = sample.contiguous()
+
+        all_images.extend([sample.cpu().numpy()])
+        print(f"created {len(all_images) * batch_size} samples")
+
+    arr = np.concatenate(all_images, axis=0)
+    arr = arr[: n_batches]
+    shape_str = "x".join([str(x) for x in arr.shape])
+    out_path = os.path.join(
+        '/home/jhan/6103/AI6103-Group-Project/output', 
+        datetime.datetime.now().strftime("%Y-%m-%d-%H-%M"), 
+        )
+    if not os.path.exists(out_path):
+        os.makedirs(out_path)
+    file_path = os.path.join(out_path, 'bedroom_{}x256x256.npz'.format(n_batches))
+    print(f"saving to {file_path}")
+    np.savez(file_path, arr)
+
+    print("sampling complete")
 
 
 if __name__ == "__main__":

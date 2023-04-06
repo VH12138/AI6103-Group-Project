@@ -93,7 +93,7 @@ def main():
     tv_scale = 150              # Controls the smoothness of the final output.
     range_scale = 50            # Controls how far out of range RGB values are allowed to be.
     cutn = 16
-    n_batches = 1
+    n_batches = 100
     init_image = None   # This can be an URL or Colab local path and must be in quotes.
     skip_timesteps = 0  # This needs to be between approx. 200 and 500 when using an init image.
     init_scale = 0      # This enhances the effect of the init image, a good value is 1000.

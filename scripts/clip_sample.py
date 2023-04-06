@@ -1,74 +1,62 @@
-"""
-Generate a large batch of image samples from a class-unconditional diffusion model 
-with CLIP as classifier guidance and save them as a large
-numpy array. This can be used to produce samples for FID evaluation.
-"""
-
 import argparse
 import os
-import time 
+import time
+import datetime
 
-import math 
-import clip 
-from torchvision import utils
-from torchvision import transforms
-
-import blobfile as bf 
+import blobfile as bf
 import numpy as np
 import torch as th
 import torch.distributed as dist
-
-import torchvision 
+import torchvision
 import torch.nn.functional as F
 
-from guided_diffusion.image_datasets import load_ref_data
-from guided_diffusion.guidance import text_loss 
-from guided_diffusion import dist_util, logger
-from guided_diffusion.script_util import (
-    NUM_CLASSES,
+from clip_diffusion.parser import create_argparser
+from clip_diffusion.logging import init_logging, make_logging_dir
+from clip_diffusion.distributed import master_only_print as print
+from clip_diffusion.distributed import is_master, init_dist, get_world_size
+from clip_diffusion.gpu_affinity import set_affinity
+from clip_diffusion.logging import init_logging, make_logging_dir
+from clip_diffusion.script_util import (
     model_and_diffusion_defaults,
     create_model_and_diffusion,
-    add_dict_to_argparser,
     args_to_dict,
+    add_dict_to_argparser,
 )
+from clip_diffusion.clip_guidance import CLIP_gd
+from clip_diffusion.image_datasets import load_ref_data
+from clip_diffusion.misc import set_random_seed
+from clip_diffusion.guidance import image_loss, text_loss
+from clip_diffusion.image_datasets import _list_image_files_recursively
+from torchvision import utils
+import math
+import clip
 
-
-def cond_fn(x, t, y, **kwargs):
-    assert y is not None
-    with th.no_grad():
-        if args.text_weight != 0:
-            text_features = clip_model.encode_text(y)
-    with th.enable_grad():
-        x_in = x.detach().requires_grad_(True)
-        clip_in = normalize(x_in)
-        image_features = clip_model.encode_image(clip_in).float()
-        if args.text_weight != 0:
-            loss_text = text_loss(image_features, text_features, args)
-        total_guidance = loss_text * args.text_weight
-
-        return th.autograd.grad(total_guidance.sum(), x_in)[0]
 
 def main():
     time0 = time.time()
     args = create_argparser().parse_args()
+    set_affinity(args.local_rank)
+    if args.randomized_seed:
+        args.seed = random.randint(0, 10000)
+    set_random_seed(args.seed, by_rank=True)
+    if not args.single_gpu:
+        init_dist(args.local_rank)
 
-    dist_util.setup_dist()
-    logger.configure()
+    tb_log = None
+    args.logdir = init_logging(args.exp_name, root_dir='results', timestamp=False)
+    if is_master():
+        tb_log = make_logging_dir(args.logdir, no_tb=True)
 
-    logger.log("creating model and diffusion...")
+    print("creating model...")
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
     model.load_state_dict(
-        dist_util.load_state_dict(args.model_path, map_location="cpu")
+        th.load(args.model_path, map_location="cpu")
     )
-    model.to(dist_util.dev())
-    if args.use_fp16:
-        model.convert_to_fp16()
+    model.to('cuda')
     model.eval()
 
-
-# ======================================================= Change to CLIP ================================================= #
     clip_model, preprocess = clip.load('ViT-B/16', device='cuda')
     if args.text_weight == 0:
         instructions = [""]
@@ -76,23 +64,60 @@ def main():
         with open(args.text_instruction_file, 'r') as f:
             instructions = f.readlines()
     instructions = [tmp.replace('\n', '') for tmp in instructions]
-    imgs = [None]
-    clip_model.eval()
+    # define image list
+    if args.image_weight == 0:
+        imgs = [None]
+    else:
+        imgs = _list_image_files_recursively(args.data_dir)
+        imgs = sorted(imgs)
+    clip_ft = CLIP_gd(args)
+    clip_ft.load_state_dict(th.load(args.clip_path, map_location='cpu'))
+    clip_ft.eval()
+    clip_ft = clip_ft.cuda()
 
-    logger.log("sampling...")
-    normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                 std=[0.26862954, 0.26130258, 0.27577711])
+    def cond_fn_sdg(x, t, y, **kwargs):
+        assert y is not None
+        with th.no_grad():
+            if args.text_weight != 0:
+                text_features = clip_model.encode_text(y)
+            if args.image_weight != 0:
+                target_img_noised = diffusion.q_sample(kwargs['ref_img'], t, tscale1000=True)
+                target_img_features = clip_ft.encode_image_list(target_img_noised, t)
+        with th.enable_grad():
+            x_in = x.detach().requires_grad_(True)
+            image_features = clip_ft.encode_image_list(x_in, t)
+            if args.text_weight != 0:
+                loss_text = text_loss(image_features, text_features, args)
+            else:
+                loss_text = 0
+            if args.image_weight != 0:
+                loss_img = image_loss(image_features, target_img_features, args)
+            else:
+                loss_img = 0
+            total_guidance = loss_text * args.text_weight + loss_img * args.image_weight
+
+            return th.autograd.grad(total_guidance.sum(), x_in)[0]
+
+
+    print("creating samples...")
+    all_images = []
     count = 0
     for img_cnt in range(len(imgs)):
-        if imgs[img_cnt] is None:
+        if imgs[img_cnt] is not None:
+            print("loading data...")
+            model_kwargs = load_ref_data(args, imgs[img_cnt])
+        else:
             model_kwargs = {}
-        
+
         for ins_cnt in range(len(instructions)):
             instruction = instructions[ins_cnt]    
             text = clip.tokenize([instruction for cnt in range(args.batch_size)]).to('cuda')
             model_kwargs['y'] = text
             model_kwargs = {k: v.to('cuda') for k, v in model_kwargs.items()}
-            
+            if args.image_weight == 0 and args.text_weight == 0:
+                cond_fn = None
+            else:
+                cond_fn = cond_fn_sdg
             with th.cuda.amp.autocast(True):
                 sample = diffusion.p_sample_loop(
                     model,
@@ -103,10 +128,33 @@ def main():
                     cond_fn=cond_fn,
                     device='cuda',
                 )
+                sample_npz = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
+                sample_npz = sample_npz.permute(0, 2, 3, 1)
+                sample_npz = sample_npz.contiguous()
+                all_images.extend([sample_npz.cpu().numpy()])
+           
+            arr = np.concatenate(all_images, axis=0)
+            arr = arr[: args.batch_size]
+            shape_str = "x".join([str(x) for x in arr.shape])
+            out_path = os.path.join(
+                '/home/jhan/6103/AI6103-Group-Project/output', 
+                datetime.datetime.now().strftime("%Y-%m-%d-%H-%M"), 
+                )
+            if not os.path.exists(out_path):
+                os.makedirs(out_path)
+            file_path = os.path.join(out_path, 'bedroom_{}x256x256.npz'.format(args.batch_size))
+            print(f"saving to {file_path}")
+            np.savez(file_path, arr)
 
             for i in range(args.batch_size):
-                out_folder = '%05d_%s' % (ins_cnt, instructions[ins_cnt])
-                out_path = os.path.join(args.logdir, out_folder, 
+                if args.text_weight == 0:
+                    out_folder = '%05d_%s' % (img_cnt, os.path.basename(imgs[img_cnt]).split('.')[0])
+                elif args.image_weight == 0:
+                    out_folder = '%05d_%s' % (ins_cnt, instructions[ins_cnt])
+                else:
+                    out_folder = '%05d_%05d_%s_%s' % (img_cnt, ins_cnt, os.path.basename(imgs[img_cnt]).split('.')[0], instructions[ins_cnt])
+
+                out_path = os.path.join(args.logdir, out_folder,
                                         f"{str(count * args.batch_size + i).zfill(5)}.png")
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
                 utils.save_image(
@@ -116,28 +164,13 @@ def main():
                     normalize=True,
                     range=(-1, 1),
                 )
-            
-            count += 1
-            logger.log(f"created {count * args.batch_size} samples")
-            logger.log(time.time() - time0)
-    
-    logger.log("sampling complete")
 
-def create_argparser():
-    defaults = dict(
-        clip_denoised=True,
-        num_samples=100,
-        batch_size=16,
-        use_ddim=False,
-        model_path="",
-        text_weight=160,
-        text_instruction_file='ref/bedroom_instructions.txt',
-    )
-    defaults.update(model_and_diffusion_defaults())
-    parser = argparse.ArgumentParser()
-    add_dict_to_argparser(parser, defaults)
-    return parser
-            
+            count += 1
+            print(f"created {count * args.batch_size} samples")
+            print('Time used in seconds ', time.time() - time0)
+
+    print("sampling complete")
+
 
 if __name__ == "__main__":
     main()

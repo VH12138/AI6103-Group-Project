@@ -61,12 +61,3 @@ SAMPLE_FLAGS="--batch_size 4 --num_samples 100 --timestep_respacing 1000"
  ```
  python scripts/noisy_clip_sample_dist.py $MODEL_FLAGS --model_path models/lsun_bedroom.pt --clip_path models/clip_bedroom.pt $SAMPLE_FLAGS
  ```
-
-
-# Results
-Here are the results on LSUN bedroom class:
-
-| Dataset      | FID  | Precision | Recall |
-|--------------|------|-----------|--------|
-| LSUN Bedroom | 1.90 | 0.66      | 0.51   |
-

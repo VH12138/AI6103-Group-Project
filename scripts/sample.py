@@ -110,7 +110,7 @@ def main():
 
 
     clip_model = clip.load('ViT-B/16', jit=False)[0].eval().requires_grad_(False).to(device)
-    with open('ref/bedroom_instructions.txt', 'r') as f:
+    with open(args.ref_path, 'r') as f:
         instructions = f.readlines()
     instructions = [tmp.replace('\n', '') for tmp in instructions]
     clip_size = clip_model.visual.input_resolution
@@ -198,6 +198,7 @@ def create_argparser():
         batch_size=4,
         use_ddim=False,
         model_path="",
+        ref_path="",
         rescale_timesteps=True,
         use_checkpoint=False,
     )

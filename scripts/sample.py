@@ -184,7 +184,7 @@ def main():
         )
     if not os.path.exists(out_path):
         os.makedirs(out_path)
-    file_path = os.path.join(out_path, 'bedroom_{}x256x256.npz'.format(n_batches))
+    file_path = os.path.join(out_path, 'bedroom_{}x256x256.npz'.format(args.num_samples))
     print(f"saving to {file_path}")
     np.savez(file_path, arr)
 
